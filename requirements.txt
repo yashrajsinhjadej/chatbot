@@ -1,7 +1,4 @@
 Flask
-sentence-transformers
-scikit-learn
 PyPDF2
-numpy
 python-dotenv
 google-generativeai

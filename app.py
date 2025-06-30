@@ -1,22 +1,18 @@
 # app.py
 
 import os
-import numpy as np
-from flask import Flask, render_template, request, jsonify
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 import PyPDF2
 import re
 import logging
 import dotenv
 import google.generativeai as genai
+from flask import Flask, render_template, request, jsonify
 
 dotenv.load_dotenv()
 
 # Config
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PDF_PATH = os.environ.get("PDF_PATH", "static/docs/hr.pdf")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev")
 
 # Configure Gemini
@@ -77,9 +73,7 @@ class GeminiClient:
 class PDFChatbot:
     def __init__(self, pdf_path):
         self.pdf_path = pdf_path
-        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
         self.chunks = []
-        self.embeddings = None
         self.gemini_client = GeminiClient()
         self.load_and_process_pdf()
 
@@ -120,14 +114,24 @@ class PDFChatbot:
         if not text:
             raise ValueError("No text extracted from PDF")
         self.chunks = self.chunk_text(text)
-        self.embeddings = self.embedding_model.encode(self.chunks)
         logging.info(f"Loaded {len(self.chunks)} chunks from PDF")
 
     def find_relevant_chunks(self, query, top_k=3):
-        q_embedding = self.embedding_model.encode([query])
-        sims = cosine_similarity(q_embedding, self.embeddings)[0]
-        indices = np.argsort(sims)[-top_k:][::-1]
-        return [(self.chunks[i], sims[i]) for i in indices]
+        """Simple keyword-based relevance scoring"""
+        query_words = set(query.lower().split())
+        scored_chunks = []
+        
+        for chunk in self.chunks:
+            chunk_words = set(chunk.lower().split())
+            # Simple overlap scoring
+            overlap = len(query_words.intersection(chunk_words))
+            if overlap > 0:
+                score = overlap / len(query_words)
+                scored_chunks.append((chunk, score))
+        
+        # Sort by score and return top_k
+        scored_chunks.sort(key=lambda x: x[1], reverse=True)
+        return scored_chunks[:top_k]
 
     def answer_question(self, question):
         chunks = self.find_relevant_chunks(question)
@@ -150,7 +154,7 @@ Please provide a clear and concise answer based on the context above."""
             return {
                 "answer": response.strip(),
                 "sources": [c[:200] + "..." for c, _ in chunks],
-                "confidence": float(np.mean([s for _, s in chunks]))
+                "confidence": sum([s for _, s in chunks]) / len(chunks) if chunks else 0
             }
         except Exception as e:
             logging.error(f"Gemini error: {e}")
