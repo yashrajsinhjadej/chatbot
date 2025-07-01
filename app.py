@@ -76,6 +76,9 @@ class PDFChatbot:
         self.chunks = []
         self.gemini_client = GeminiClient()
         self.load_and_process_pdf()
+        
+        # Remove the static pattern definitions since we're using Gemini now
+        # self.basic_patterns and self.hr_keywords are no longer needed
 
     def extract_text(self):
         text = ""
@@ -116,6 +119,78 @@ class PDFChatbot:
         self.chunks = self.chunk_text(text)
         logging.info(f"Loaded {len(self.chunks)} chunks from PDF")
 
+    def classify_user_intent(self, question):
+        """Use Gemini to classify user intent and determine response strategy"""
+        classification_prompt = f"""You are an intent classifier for an HR chatbot. Analyze the user's question and classify it into one of these categories:
+
+1. GREETING - Simple greetings, hellos, good morning, etc.
+2. CASUAL_CHAT - How are you, what's up, casual conversation not related to HR
+3. GRATITUDE - Thank you, thanks, appreciation messages
+4. GOODBYE - Bye, farewell, see you later, etc.
+5. HR_QUERY - Any question related to HR policies, employee benefits, leave, company policies, work procedures, etc. (even with spelling mistakes)
+6. NON_HR_QUERY - Questions not related to HR or company policies (weather, general knowledge, etc.)
+
+User question: "{question}"
+
+Respond with ONLY the category name (GREETING, CASUAL_CHAT, GRATITUDE, GOODBYE, HR_QUERY, or NON_HR_QUERY) and a brief reason in this format:
+CATEGORY: [category]
+REASON: [brief explanation]"""
+
+        try:
+            response = self.gemini_client.generate(classification_prompt, max_tokens=100, temperature=0.1)
+            
+            # Parse the response
+            lines = response.strip().split('\n')
+            category = None
+            reason = None
+            
+            for line in lines:
+                if line.startswith('CATEGORY:'):
+                    category = line.replace('CATEGORY:', '').strip()
+                elif line.startswith('REASON:'):
+                    reason = line.replace('REASON:', '').strip()
+            
+            return category, reason
+            
+        except Exception as e:
+            logging.error(f"Intent classification error: {e}")
+            # Fallback to HR_QUERY if classification fails
+            return "HR_QUERY", "Classification failed, defaulting to HR query"
+
+    def generate_contextual_response(self, question, category):
+        """Generate appropriate response based on classified intent"""
+        response_prompts = {
+            'GREETING': f"""The user said: "{question}"
+            
+            Respond as a friendly HR assistant with a warm greeting. Keep it professional but welcoming. Mention that you're here to help with HR questions.""",
+            
+            'CASUAL_CHAT': f"""The user said: "{question}"
+            
+            Respond in a friendly, professional manner as an HR assistant. Keep the conversation light but redirect gently to HR topics you can help with.""",
+            
+            'GRATITUDE': f"""The user said: "{question}"
+            
+            Respond appropriately to their thanks as an HR assistant. Be gracious and offer continued assistance with HR matters.""",
+            
+            'GOODBYE': f"""The user said: "{question}"
+            
+            Respond with a professional but warm farewell as an HR assistant. Invite them to return with any HR questions.""",
+            
+            'NON_HR_QUERY': f"""The user asked: "{question}"
+            
+            Politely explain that you're specifically designed to help with HR-related questions and company policies. Encourage them to ask about HR topics like leave policies, benefits, procedures, etc. Be helpful but redirect to your purpose."""
+        }
+        
+        if category in response_prompts:
+            try:
+                response = self.gemini_client.generate(response_prompts[category], max_tokens=150, temperature=0.7)
+                return response.strip()
+            except Exception as e:
+                logging.error(f"Response generation error: {e}")
+                return "I'm here to help with your HR questions. How can I assist you today?"
+        
+        return "How can I help you with HR-related questions today?"
+
     def find_relevant_chunks(self, query, top_k=3):
         """Simple keyword-based relevance scoring"""
         query_words = set(query.lower().split())
@@ -134,31 +209,77 @@ class PDFChatbot:
         return scored_chunks[:top_k]
 
     def answer_question(self, question):
-        chunks = self.find_relevant_chunks(question)
-        if not chunks:
-            return {"answer": "No relevant content found.", "sources": [], "confidence": 0}
+        # First, use Gemini to classify the user's intent
+        category, reason = self.classify_user_intent(question)
+        logging.info(f"Question classified as: {category}, Reason: {reason}")
         
-        context = "\n\n".join([c for c, _ in chunks])
+        # Handle non-HR queries with contextual responses
+        if category in ['GREETING', 'CASUAL_CHAT', 'GRATITUDE', 'GOODBYE', 'NON_HR_QUERY']:
+            return {
+                "answer": self.generate_contextual_response(question, category),
+                "sources": [],
+                "confidence": 1.0,
+                "type": category.lower(),
+                "classification_reason": reason
+            }
         
-        prompt = f"""You are a helpful assistant that answers questions based on the provided context. Use only the information from the context to answer the question. If the context doesn't contain enough information to answer the question, say so clearly.
+        # For HR queries, search the PDF
+        if category == 'HR_QUERY':
+            chunks = self.find_relevant_chunks(question)
+            if not chunks:
+                return {
+                    "answer": "I couldn't find relevant information about this topic in the HR documents. Please contact your HR department directly for assistance, or try rephrasing your question with different keywords.",
+                    "sources": [],
+                    "confidence": 0,
+                    "type": "no_relevant_content",
+                    "classification_reason": reason
+                }
+            
+            context = "\n\n".join([c for c, _ in chunks])
+            
+            prompt = f"""You are an HR assistant that answers questions based ONLY on the provided HR policy context. Follow these rules strictly:
 
-Context:
+1. Use ONLY the information from the context provided below
+2. If the context doesn't contain enough information to answer the question, clearly state that the information is not available in the HR documents
+3. Do not make up or assume any information not present in the context
+4. Be specific and reference the relevant sections when possible
+5. If asked about company-specific policies, refer only to what's in the context
+6. Handle spelling mistakes or variations in the user's question gracefully
+
+Context from HR Documents:
 {context}
 
-Question: {question}
+User Question: {question}
 
-Please provide a clear and concise answer based on the context above."""
+Please provide a clear and accurate answer based ONLY on the HR policy context above. If the information is not available in the context, clearly state that."""
+            
+            try:
+                response = self.gemini_client.generate(prompt, max_tokens=512, temperature=0.2)
+                return {
+                    "answer": response.strip(),
+                    "sources": [c[:200] + "..." for c, _ in chunks],
+                    "confidence": sum([s for _, s in chunks]) / len(chunks) if chunks else 0,
+                    "type": "hr_query",
+                    "classification_reason": reason
+                }
+            except Exception as e:
+                logging.error(f"Gemini error: {e}")
+                return {
+                    "answer": "I'm having trouble processing your question right now. Please try again or contact your HR department directly.",
+                    "sources": [],
+                    "confidence": 0,
+                    "type": "error",
+                    "classification_reason": reason
+                }
         
-        try:
-            response = self.gemini_client.generate(prompt, max_tokens=512, temperature=0.3)
-            return {
-                "answer": response.strip(),
-                "sources": [c[:200] + "..." for c, _ in chunks],
-                "confidence": sum([s for _, s in chunks]) / len(chunks) if chunks else 0
-            }
-        except Exception as e:
-            logging.error(f"Gemini error: {e}")
-            return {"answer": "Error generating response from Gemini model.", "sources": [], "confidence": 0}
+        # Fallback for any unhandled cases
+        return {
+            "answer": "I'm not sure how to handle that request. Could you please rephrase your question or ask me about HR policies and procedures?",
+            "sources": [],
+            "confidence": 0.5,
+            "type": "unknown",
+            "classification_reason": reason
+        }
 
 # Initialize chatbot
 try:
@@ -209,6 +330,3 @@ def status():
 
 if __name__ == "__main__":
     app.run(debug=True)
-
-# For Vercel deployment
-app_instance = app
